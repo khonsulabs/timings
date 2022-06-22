@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt::{Debug, Display},
     hash::Hash,
+    marker::PhantomData,
     ops::Deref,
     sync::Arc,
     thread::JoinHandle,
@@ -13,10 +14,18 @@ mod formatting;
 
 #[cfg(feature = "formatting")]
 pub use formatting::*;
+use parking_lot::{lock_api::ArcRwLockWriteGuard, RawRwLock, RwLock};
 
-#[derive(Clone)]
 pub struct Timings<Metric> {
     sender: flume::Sender<(Label, Metric, Duration)>,
+}
+
+impl<Metric> Clone for Timings<Metric> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+        }
+    }
 }
 
 impl<Metric> Timings<Metric>
@@ -245,4 +254,251 @@ pub struct MetricStats {
 pub struct MetricSummary {
     pub invocations: usize,
     pub labels: BTreeMap<Label, MetricStats>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThreadSync {
+    ready_sender: flume::Sender<()>,
+    lock: Arc<RwLock<()>>,
+}
+
+impl ThreadSync {
+    pub fn new(number_of_threads: usize, thread_start_timeout: Duration) -> (Self, ThreadStarter) {
+        let (ready_sender, ready_receiver) = flume::bounded(number_of_threads);
+        let sync = Self {
+            lock: Arc::default(),
+            ready_sender,
+        };
+        let _guard = sync.lock.write_arc();
+        (
+            sync,
+            ThreadStarter {
+                number_of_threads,
+                ready_receiver,
+                thread_start_timeout,
+                _guard,
+            },
+        )
+    }
+
+    pub fn wait_for_signal(self) {
+        self.ready_sender
+            .send(())
+            .expect("main thread no longer running");
+
+        // We use an RwLock to control this, as an easy way to wake all threads
+        // as quickly as possible. The starter is simply a Write guard that is
+        // dropped to start all the threads.
+        drop(self.lock.read());
+    }
+}
+
+pub struct ThreadStarter {
+    number_of_threads: usize,
+    ready_receiver: flume::Receiver<()>,
+    thread_start_timeout: Duration,
+    _guard: ArcRwLockWriteGuard<RawRwLock, ()>,
+}
+
+impl ThreadStarter {
+    pub fn start_threads(self) -> Result<(), Self> {
+        let deadline = Instant::now() + self.thread_start_timeout;
+
+        for _ in 0..self.number_of_threads {
+            if self.ready_receiver.recv_deadline(deadline).is_err() {
+                return Err(self);
+            }
+        }
+
+        drop(self);
+
+        Ok(())
+    }
+}
+
+pub struct Benchmark<Metric, Config, Error> {
+    threads: Vec<usize>,
+    configs: Vec<Config>,
+    thread_start_timeout: Duration,
+    functions: Vec<Arc<dyn AnyBenchmarkImplementation<Metric, Config, Error>>>,
+}
+
+impl<Metric, Error> Benchmark<Metric, (), Error> {
+    pub fn new() -> Self {
+        Self {
+            threads: Vec::new(),
+            configs: vec![()],
+            thread_start_timeout: Duration::from_secs(15),
+            functions: Vec::new(),
+        }
+    }
+}
+
+impl<Metric, Error> Default for Benchmark<Metric, (), Error> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<Metric, Config, Error> Benchmark<Metric, Config, Error>
+where
+    Error: Send + Sync + 'static,
+    Config: Send + Clone + 'static,
+    Metric: Send + Sync + 'static,
+{
+    pub fn for_config(config: Config) -> Self {
+        Self {
+            threads: Vec::new(),
+            configs: vec![config],
+            thread_start_timeout: Duration::from_secs(15),
+            functions: Vec::new(),
+        }
+    }
+
+    pub fn for_each_config(configs: Vec<Config>) -> Self {
+        Self {
+            threads: Vec::new(),
+            configs,
+            thread_start_timeout: Duration::from_secs(15),
+            functions: Vec::new(),
+        }
+    }
+
+    pub fn with_number_of_threads(mut self, threads: usize) -> Self {
+        self.threads = vec![threads];
+        self
+    }
+
+    pub fn with_thread_start_timeout(mut self, thread_start_timeout: Duration) -> Self {
+        self.thread_start_timeout = thread_start_timeout;
+        self
+    }
+
+    pub fn with_each_number_of_threads<ThreadCounts: IntoIterator<Item = usize>>(
+        mut self,
+        threads: ThreadCounts,
+    ) -> Self {
+        self.threads = threads.into_iter().collect();
+        self
+    }
+
+    pub fn with<Implementation: BenchmarkImplementation<Metric, Config, Error>>(mut self) -> Self {
+        self.functions
+            .push(Arc::new(BenchmarkImpl::<Implementation>::default()));
+        self
+    }
+
+    pub fn run(self, timings: &Timings<Metric>) -> Result<(), Error> {
+        let threads = if self.threads.is_empty() {
+            vec![1]
+        } else {
+            self.threads
+        };
+
+        for thread_count in threads {
+            for config in &self.configs {
+                for function in &self.functions {
+                    function.reset(false)?;
+                    let (sync, starter) = ThreadSync::new(thread_count, self.thread_start_timeout);
+                    let thread_handles = function.measure(thread_count, config, sync, timings)?;
+
+                    if starter.start_threads().is_err() {
+                        eprintln!("Benchmark thread failed to start in time.");
+                    }
+
+                    for handle in thread_handles {
+                        if let Err(err) = handle.join() {
+                            eprintln!("Benchmark thread panic: {err:?}");
+                        }
+                    }
+                    function.reset(true)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+pub trait BenchmarkImplementation<Metric, Config, Error>: Sized + Send + Sync + 'static {
+    type SharedConfig: Clone + Send + Sync + 'static;
+
+    fn initialize_shared_config(
+        number_of_threads: usize,
+        config: &Config,
+    ) -> Result<Self::SharedConfig, Error>;
+
+    fn reset(shutting_down: bool) -> Result<(), Error>;
+
+    fn initialize(number_of_threads: usize, config: Self::SharedConfig) -> Result<Self, Error>;
+
+    fn measure(&mut self, measurements: &Timings<Metric>) -> Result<(), Error>;
+}
+
+trait AnyBenchmarkImplementation<Metric, Config, Error>: Sync + Send + 'static {
+    fn reset(&self, shutting_down: bool) -> Result<(), Error>;
+    fn measure(
+        &self,
+        number_of_threads: usize,
+        data: &Config,
+        thread_sync: ThreadSync,
+        measurements: &Timings<Metric>,
+    ) -> Result<Vec<JoinHandle<Result<(), Error>>>, Error>;
+}
+
+// impl<T, Metric, Config, Error> AnyBenchmarkImplementation<Metric, Config, Error> for T
+// where
+//     T: BenchmarkImplementation<Metric, Config, Error>,
+// {
+//     fn measure(
+//         config: Config,
+//         thread_sync: ThreadSync,
+//         measurements: &Timings<Metric>,
+//     ) -> Result<(), Error> {
+//         let mut data = Self::initialize(config)?;
+//         thread_sync.wait_for_signal();
+//         T::measure(&mut data, measurements)
+//     }
+// }
+
+struct BenchmarkImpl<T>(PhantomData<T>);
+
+impl<T> Default for BenchmarkImpl<T> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<T, Metric, Config, Error> AnyBenchmarkImplementation<Metric, Config, Error>
+    for BenchmarkImpl<T>
+where
+    T: BenchmarkImplementation<Metric, Config, Error> + Send + Sync,
+    Error: Send + 'static,
+    Metric: Send + 'static,
+{
+    fn measure(
+        &self,
+        number_of_threads: usize,
+        config: &Config,
+        thread_sync: ThreadSync,
+        measurements: &Timings<Metric>,
+    ) -> Result<Vec<JoinHandle<Result<(), Error>>>, Error> {
+        let mut thread_handles = Vec::with_capacity(number_of_threads);
+        let shared_config = T::initialize_shared_config(number_of_threads, config)?;
+        for _ in 0..number_of_threads {
+            let config = shared_config.clone();
+            let measurements = measurements.clone();
+            let thread_sync = thread_sync.clone();
+            thread_handles.push(std::thread::spawn(move || {
+                let mut data = T::initialize(number_of_threads, config)?;
+                thread_sync.wait_for_signal();
+                T::measure(&mut data, &measurements)
+            }));
+        }
+        Ok(thread_handles)
+    }
+
+    fn reset(&self, shutting_down: bool) -> Result<(), Error> {
+        T::reset(shutting_down)
+    }
 }
