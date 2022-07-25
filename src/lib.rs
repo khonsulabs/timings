@@ -259,88 +259,6 @@ pub struct MetricSummary {
     pub labels: BTreeMap<Label, MetricStats>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ThreadSync {
-    data: Arc<ThreadSyncData>,
-}
-
-#[derive(Debug, Default)]
-struct ThreadSyncData {
-    parked_threads: Mutex<Vec<Thread>>,
-    ready_sync: Condvar,
-    countdown: AtomicUsize,
-}
-
-impl ThreadSync {
-    pub fn new(number_of_threads: usize, thread_start_timeout: Duration) -> (Self, ThreadStarter) {
-        let sync = Self {
-            data: Arc::new(ThreadSyncData {
-                countdown: AtomicUsize::new(number_of_threads),
-                ..ThreadSyncData::default()
-            }),
-        };
-        (
-            sync.clone(),
-            ThreadStarter {
-                number_of_threads,
-                sync,
-                thread_start_timeout,
-            },
-        )
-    }
-
-    pub fn wait_for_signal(self) {
-        let mut parked_threads = self.data.parked_threads.lock();
-        parked_threads.push(std::thread::current());
-        drop(parked_threads);
-        self.data.ready_sync.notify_one();
-        std::thread::park();
-
-        // Oce we're unparked, enter a spinlock waiting for countdown to reach 0.
-        let mut remaining_threads = self.data.countdown.fetch_sub(1, Ordering::SeqCst) - 1;
-        while remaining_threads > 0 {
-            remaining_threads = self.data.countdown.load(Ordering::SeqCst);
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct ThreadStarter {
-    number_of_threads: usize,
-    sync: ThreadSync,
-    thread_start_timeout: Duration,
-}
-
-impl ThreadStarter {
-    pub fn start_threads(self) -> Result<(), Self> {
-        let deadline = Instant::now() + self.thread_start_timeout;
-
-        let mut parked_threads = self.sync.data.parked_threads.lock();
-        if self
-            .sync
-            .data
-            .ready_sync
-            .wait_while_until(
-                &mut parked_threads,
-                |threads| threads.len() < self.number_of_threads,
-                deadline,
-            )
-            .timed_out()
-        {
-            drop(parked_threads);
-            return Err(self);
-        }
-
-        assert_eq!(self.number_of_threads, parked_threads.len());
-
-        for thread in parked_threads.drain(..) {
-            thread.unpark();
-        }
-
-        Ok(())
-    }
-}
-
 pub struct Benchmark<Metric, Config, Error> {
     threads: Vec<usize>,
     configs: Vec<Config>,
@@ -424,10 +342,15 @@ where
             for config in &self.configs {
                 for function in &self.functions {
                     function.reset(false)?;
-                    let (sync, starter) = ThreadSync::new(thread_count, self.thread_start_timeout);
-                    let thread_handles = function.measure(thread_count, config, sync, timings)?;
+                    let starter = ThreadSync::new(thread_count, self.thread_start_timeout);
+                    let thread_handles = function.measure(
+                        thread_count,
+                        config,
+                        starter.signal().clone(),
+                        timings,
+                    )?;
 
-                    if starter.start_threads().is_err() {
+                    if starter.signal_threads().is_err() {
                         eprintln!("Benchmark thread failed to start in time.");
                     }
 
@@ -466,7 +389,7 @@ trait AnyBenchmarkImplementation<Metric, Config, Error>: Sync + Send + 'static {
         &self,
         number_of_threads: usize,
         data: &Config,
-        thread_sync: ThreadSync,
+        thread_sync: ThreadSignal,
         measurements: &Timings<Metric>,
     ) -> Result<Vec<JoinHandle<Result<(), Error>>>, Error>;
 }
@@ -505,7 +428,7 @@ where
         &self,
         number_of_threads: usize,
         config: &Config,
-        thread_sync: ThreadSync,
+        thread_sync: ThreadSignal,
         measurements: &Timings<Metric>,
     ) -> Result<Vec<JoinHandle<Result<(), Error>>>, Error> {
         let mut thread_handles = Vec::with_capacity(number_of_threads);
@@ -516,7 +439,7 @@ where
             let thread_sync = thread_sync.clone();
             thread_handles.push(std::thread::spawn(move || {
                 let mut data = T::initialize(number_of_threads, config)?;
-                thread_sync.wait_for_signal();
+                thread_sync.wait();
                 T::measure(&mut data, &measurements)
             }));
         }
@@ -528,29 +451,148 @@ where
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ThreadSignal {
+    data: Arc<ThreadSyncData>,
+}
+
+#[derive(Debug)]
+struct ThreadSyncData {
+    parked_threads: Mutex<Vec<Thread>>,
+    ready_sync: Condvar,
+    countdown: AtomicUsize,
+    number_of_threads: usize,
+    thread_start_timeout: Duration,
+}
+
+impl ThreadSignal {
+    pub fn wait(self) {
+        let mut parked_threads = self.data.parked_threads.lock();
+        parked_threads.push(std::thread::current());
+        drop(parked_threads);
+        self.data.ready_sync.notify_one();
+        std::thread::park();
+
+        // Once we're unparked, enter a spinlock waiting for countdown to reach 0.
+        let mut remaining_threads = self.data.countdown.fetch_sub(1, Ordering::SeqCst) - 1;
+        while remaining_threads > 0 {
+            remaining_threads = self.data.countdown.load(Ordering::SeqCst);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ThreadSync {
+    signal: ThreadSignal,
+}
+
+impl ThreadSync {
+    pub fn new(number_of_threads: usize, thread_start_timeout: Duration) -> Self {
+        let signal = ThreadSignal {
+            data: Arc::new(ThreadSyncData {
+                countdown: AtomicUsize::new(number_of_threads),
+                thread_start_timeout,
+                number_of_threads,
+                parked_threads: Mutex::default(),
+                ready_sync: Condvar::new(),
+            }),
+        };
+        Self { signal }
+    }
+
+    pub const fn signal(&self) -> &ThreadSignal {
+        &self.signal
+    }
+
+    pub fn synchronize_spawn<F: Fn() + Clone + Send + 'static>(
+        number_of_threads: usize,
+        thread_start_timeout: Duration,
+        thread_main: F,
+    ) {
+        let starter = Self::new(number_of_threads, thread_start_timeout);
+        for _ in 0..number_of_threads {
+            let thread_main = thread_main.clone();
+            let sync = starter.signal().clone();
+            std::thread::spawn(move || {
+                sync.wait();
+                thread_main();
+            });
+        }
+
+        starter.signal_threads().unwrap();
+    }
+
+    pub fn synchronize_spawn_with<T: Clone + Send + 'static, F: Fn(T) + Clone + Send + 'static>(
+        number_of_threads: usize,
+        thread_start_timeout: Duration,
+        context: &T,
+        thread_main: F,
+    ) {
+        let starter = Self::new(number_of_threads, thread_start_timeout);
+        for _ in 0..number_of_threads {
+            let thread_main = thread_main.clone();
+            let sync = starter.signal().clone();
+            let context = context.clone();
+            std::thread::spawn(move || {
+                sync.wait();
+                thread_main(context);
+            });
+        }
+
+        starter.signal_threads().unwrap();
+    }
+
+    pub fn signal_threads(self) -> Result<(), Self> {
+        let deadline = Instant::now() + self.signal.data.thread_start_timeout;
+
+        let mut parked_threads = self.signal.data.parked_threads.lock();
+        if self
+            .signal
+            .data
+            .ready_sync
+            .wait_while_until(
+                &mut parked_threads,
+                |threads| threads.len() < self.signal.data.number_of_threads,
+                deadline,
+            )
+            .timed_out()
+        {
+            drop(parked_threads);
+            return Err(self);
+        }
+
+        assert_eq!(self.signal.data.number_of_threads, parked_threads.len());
+
+        for thread in parked_threads.drain(..) {
+            thread.unpark();
+        }
+
+        Ok(())
+    }
+}
+
 #[test]
 fn thread_start_tolerance() {
     // We need at least 2 threads to test this.
     let number_of_threads = std::thread::available_parallelism().unwrap().get().min(2);
-    let (blocker, starter) = ThreadSync::new(number_of_threads, Duration::from_secs(1));
 
     let (sender, receiver) = flume::bounded(number_of_threads);
 
-    for _ in 0..number_of_threads {
-        let sender = sender.clone();
-        let blocker = blocker.clone();
-        std::thread::spawn(move || {
-            blocker.wait_for_signal();
+    ThreadSync::synchronize_spawn_with(
+        number_of_threads,
+        Duration::from_secs(1),
+        &sender,
+        |sender| {
             sender.send(Instant::now()).unwrap();
-        });
-    }
-
-    starter.start_threads().unwrap();
+        },
+    );
+    drop(sender);
 
     let mut start_times = Vec::with_capacity(number_of_threads);
     for _ in 0..number_of_threads {
         start_times.push(receiver.recv().unwrap());
     }
+    assert!(receiver.try_recv().is_err());
     let earliest_start = start_times.iter().min().unwrap();
     let latest_start = start_times.iter().max().unwrap();
     let delta = latest_start
