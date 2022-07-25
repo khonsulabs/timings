@@ -4,8 +4,11 @@ use std::{
     hash::Hash,
     marker::PhantomData,
     ops::Deref,
-    sync::Arc,
-    thread::JoinHandle,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    thread::{JoinHandle, Thread},
     time::{Duration, Instant},
 };
 
@@ -14,7 +17,7 @@ mod formatting;
 
 #[cfg(feature = "formatting")]
 pub use formatting::*;
-use parking_lot::{lock_api::ArcRwLockWriteGuard, RawRwLock, RwLock};
+use parking_lot::{Condvar, Mutex};
 
 pub struct Timings<Metric> {
     sender: flume::Sender<(Label, Metric, Duration)>,
@@ -256,61 +259,83 @@ pub struct MetricSummary {
     pub labels: BTreeMap<Label, MetricStats>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ThreadSync {
-    ready_sender: flume::Sender<()>,
-    lock: Arc<RwLock<()>>,
+    data: Arc<ThreadSyncData>,
+}
+
+#[derive(Debug, Default)]
+struct ThreadSyncData {
+    parked_threads: Mutex<Vec<Thread>>,
+    ready_sync: Condvar,
+    countdown: AtomicUsize,
 }
 
 impl ThreadSync {
     pub fn new(number_of_threads: usize, thread_start_timeout: Duration) -> (Self, ThreadStarter) {
-        let (ready_sender, ready_receiver) = flume::bounded(number_of_threads);
         let sync = Self {
-            lock: Arc::default(),
-            ready_sender,
+            data: Arc::new(ThreadSyncData {
+                countdown: AtomicUsize::new(number_of_threads),
+                ..ThreadSyncData::default()
+            }),
         };
-        let _guard = sync.lock.write_arc();
         (
-            sync,
+            sync.clone(),
             ThreadStarter {
                 number_of_threads,
-                ready_receiver,
+                sync,
                 thread_start_timeout,
-                _guard,
             },
         )
     }
 
     pub fn wait_for_signal(self) {
-        self.ready_sender
-            .send(())
-            .expect("main thread no longer running");
+        let mut parked_threads = self.data.parked_threads.lock();
+        parked_threads.push(std::thread::current());
+        drop(parked_threads);
+        self.data.ready_sync.notify_one();
+        std::thread::park();
 
-        // We use an RwLock to control this, as an easy way to wake all threads
-        // as quickly as possible. The starter is simply a Write guard that is
-        // dropped to start all the threads.
-        drop(self.lock.read());
+        // Oce we're unparked, enter a spinlock waiting for countdown to reach 0.
+        let mut remaining_threads = self.data.countdown.fetch_sub(1, Ordering::SeqCst) - 1;
+        while remaining_threads > 0 {
+            remaining_threads = self.data.countdown.load(Ordering::SeqCst);
+        }
     }
 }
 
+#[derive(Debug)]
 pub struct ThreadStarter {
     number_of_threads: usize,
-    ready_receiver: flume::Receiver<()>,
+    sync: ThreadSync,
     thread_start_timeout: Duration,
-    _guard: ArcRwLockWriteGuard<RawRwLock, ()>,
 }
 
 impl ThreadStarter {
     pub fn start_threads(self) -> Result<(), Self> {
         let deadline = Instant::now() + self.thread_start_timeout;
 
-        for _ in 0..self.number_of_threads {
-            if self.ready_receiver.recv_deadline(deadline).is_err() {
-                return Err(self);
-            }
+        let mut parked_threads = self.sync.data.parked_threads.lock();
+        if self
+            .sync
+            .data
+            .ready_sync
+            .wait_while_until(
+                &mut parked_threads,
+                |threads| threads.len() < self.number_of_threads,
+                deadline,
+            )
+            .timed_out()
+        {
+            drop(parked_threads);
+            return Err(self);
         }
 
-        drop(self);
+        assert_eq!(self.number_of_threads, parked_threads.len());
+
+        for thread in parked_threads.drain(..) {
+            thread.unpark();
+        }
 
         Ok(())
     }
@@ -501,4 +526,36 @@ where
     fn reset(&self, shutting_down: bool) -> Result<(), Error> {
         T::reset(shutting_down)
     }
+}
+
+#[test]
+fn thread_start_tolerance() {
+    // We need at least 2 threads to test this.
+    let number_of_threads = std::thread::available_parallelism().unwrap().get().min(2);
+    let (blocker, starter) = ThreadSync::new(number_of_threads, Duration::from_secs(1));
+
+    let (sender, receiver) = flume::bounded(number_of_threads);
+
+    for _ in 0..number_of_threads {
+        let sender = sender.clone();
+        let blocker = blocker.clone();
+        std::thread::spawn(move || {
+            blocker.wait_for_signal();
+            sender.send(Instant::now()).unwrap();
+        });
+    }
+
+    starter.start_threads().unwrap();
+
+    let mut start_times = Vec::with_capacity(number_of_threads);
+    for _ in 0..number_of_threads {
+        start_times.push(receiver.recv().unwrap());
+    }
+    let earliest_start = start_times.iter().min().unwrap();
+    let latest_start = start_times.iter().max().unwrap();
+    let delta = latest_start
+        .checked_duration_since(*earliest_start)
+        .unwrap();
+    println!("Sync start instant max delta: {:.03}ns", delta.as_nanos());
+    assert!(delta < Duration::from_micros(10));
 }
