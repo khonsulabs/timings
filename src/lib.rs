@@ -1,14 +1,29 @@
+#![doc = include_str!("../README.md")]
+#![forbid(unsafe_code)]
+#![warn(
+    clippy::cargo,
+    missing_docs,
+    clippy::pedantic,
+    future_incompatible,
+    rust_2018_idioms
+)]
+#![allow(
+    clippy::option_if_let_else,
+    clippy::module_name_repetitions,
+    clippy::missing_errors_doc
+)]
+
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt::{Debug, Display},
     hash::Hash,
     marker::PhantomData,
     ops::Deref,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    thread::{JoinHandle, Thread},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -19,14 +34,38 @@ mod formatting;
 pub use formatting::*;
 use parking_lot::{Condvar, Mutex};
 
+/// A collection of [`MetricSummary`] ordered by `Metric`.
+pub type MetricSummaries<Metric> = BTreeMap<Metric, MetricSummary>;
+
+/// Measures the time `Metric`s take to execute.
+#[derive(Debug)]
 pub struct Timings<Metric> {
-    sender: flume::Sender<(Label, Metric, Duration)>,
+    sender: Option<flume::Sender<(Label, Metric, Duration)>>,
+    stats_thread: Arc<Mutex<Option<JoinHandle<MetricSummaries<Metric>>>>>,
 }
 
 impl<Metric> Clone for Timings<Metric> {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            stats_thread: self.stats_thread.clone(),
+        }
+    }
+}
+
+impl<Metric> Default for Timings<Metric>
+where
+    Metric: Send + Ord + Hash + Eq + Display + Debug + Clone + 'static,
+{
+    fn default() -> Self {
+        let (sender, receiver) = flume::unbounded();
+        let stats_handle = std::thread::Builder::new()
+            .name(String::from("measurements"))
+            .spawn(move || stats_thread(&receiver))
+            .unwrap();
+        Self {
+            sender: Some(sender),
+            stats_thread: Arc::new(Mutex::new(Some(stats_handle))),
         }
     }
 }
@@ -35,33 +74,82 @@ impl<Metric> Timings<Metric>
 where
     Metric: Send + Ord + Hash + Eq + Display + Debug + Clone + 'static,
 {
-    pub fn new() -> (Self, JoinHandle<BTreeMap<Metric, MetricSummary>>) {
-        let (sender, receiver) = flume::unbounded();
-        let stats_handle = std::thread::Builder::new()
-            .name(String::from("measurements"))
-            .spawn(move || stats_thread(receiver))
-            .unwrap();
-        (Self { sender }, stats_handle)
+    /// Begin a [`Timing`] of `metric` for `label`. Labels are used group
+    /// multiple invocations of `metric`. For example, if a benchmark is
+    /// measuring 3 different crates, `label` could be the crate name and
+    /// `metric` would be the operation being measured across the three crates.
+    pub fn begin(&self, label: impl Into<Label>, metric: Metric) -> Timing<'_, Metric> {
+        Timing {
+            target: self.sender.as_ref().expect("already finished"),
+            label: label.into(),
+            metric,
+            start: Instant::now(),
+        }
     }
 
-    pub fn begin(&self, label: impl Into<Label>, metric: Metric) -> Measurement<'_, Metric> {
-        Measurement {
-            target: &self.sender,
-            label: label.into(),
+    /// Waits for all measurements to conclude and returns an organized summary.
+    ///
+    /// # Panics
+    ///
+    /// This function must only be called once. If more than one clone calls
+    /// this function, a panic will occur.
+    ///
+    /// This will also panic if the thread that is collecting the summaries
+    /// panics.
+    #[must_use]
+    pub fn wait_for_stats(mut self) -> MetricSummaries<Metric> {
+        self.sender = None;
+        let mut stats_thread = self.stats_thread.lock();
+        let join_handle = stats_thread.take().expect("wait_for_stats already called");
+        join_handle
+            .join()
+            .expect("stats thread could not be joined")
+    }
+}
+
+/// A [`Timings`] instance that uses the same label for all metrics measured.
+#[derive(Debug)]
+pub struct LabeledTimings<Metric> {
+    label: Label,
+    timings: Timings<Metric>,
+}
+
+impl<Metric> LabeledTimings<Metric> {
+    /// Begin a [`Timing`] of `metric`.
+    pub fn begin(&self, metric: Metric) -> Timing<'_, Metric> {
+        Timing {
+            target: self.timings.sender.as_ref().expect("already finished"),
+            label: self.label.clone(),
             metric,
             start: Instant::now(),
         }
     }
 }
 
-pub struct Measurement<'a, Metric> {
+impl<Metric> Clone for LabeledTimings<Metric> {
+    fn clone(&self) -> Self {
+        Self {
+            label: self.label.clone(),
+            timings: self.timings.clone(),
+        }
+    }
+}
+
+/// An ongoing timing measurement of a `Metric`.
+pub struct Timing<'a, Metric> {
     target: &'a flume::Sender<(Label, Metric, Duration)>,
     label: Label,
     metric: Metric,
     start: Instant,
 }
 
-impl<'a, Metric> Measurement<'a, Metric> {
+impl<'a, Metric> Timing<'a, Metric> {
+    /// Completes the measurement of this metric.
+    ///
+    /// # Panics
+    ///
+    /// Panics if time goes backwards or if there is an error sending the
+    /// measurement to the collection thread.
     pub fn finish(self) {
         let duration = Instant::now()
             .checked_duration_since(self.start)
@@ -72,9 +160,10 @@ impl<'a, Metric> Measurement<'a, Metric> {
     }
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn stats_thread<Metric: Ord + Eq + Hash + Display + Debug + Clone>(
-    metric_receiver: flume::Receiver<(Label, Metric, Duration)>,
-) -> BTreeMap<Metric, MetricSummary> {
+    metric_receiver: &flume::Receiver<(Label, Metric, Duration)>,
+) -> MetricSummaries<Metric> {
     let mut all_results: BTreeMap<Metric, BTreeMap<Label, Vec<u64>>> = BTreeMap::new();
     let mut accumulated_label_stats: BTreeMap<Label, Duration> = BTreeMap::new();
     let mut longest_by_metric = HashMap::new();
@@ -133,14 +222,14 @@ fn stats_thread<Metric: Ord + Eq + Hash + Display + Debug + Clone>(
                         min,
                         max,
                         stddev,
-                        outliers,
                         plottable_stats,
+                        outliers,
                     },
                 )
             })
             .collect::<BTreeMap<_, _>>();
 
-        for (label, metrics) in label_stats.into_iter() {
+        for (label, metrics) in label_stats {
             let report = operations
                 .entry(metric.clone())
                 .or_insert_with(|| MetricSummary {
@@ -153,9 +242,13 @@ fn stats_thread<Metric: Ord + Eq + Hash + Display + Debug + Clone>(
     operations
 }
 
+/// A cheap-to-clone string type. Internally this can be an `&'static str` or a
+/// `String` stored within an [`Arc`].
 #[derive(Clone)]
 pub enum Label {
+    /// A static reference to a string slice.
     Static(&'static str),
+    /// A reference-counted String value.
     Owned(Arc<String>),
 }
 
@@ -225,40 +318,70 @@ impl From<String> for Label {
     }
 }
 
-fn stddev(data: &[u64], average: f64) -> f64 {
-    if data.is_empty() {
+#[allow(clippy::cast_precision_loss)]
+#[doc(hidden)]
+#[must_use]
+pub fn stddev<
+    'a,
+    Data: IntoIterator<Item = &'a u64, IntoIter = Iter>,
+    Iter: Iterator<Item = &'a u64> + ExactSizeIterator,
+>(
+    data: Data,
+    average: f64,
+) -> f64 {
+    let data = data.into_iter();
+    let data_points = data.len();
+    if data_points == 0 {
         0.
     } else {
         let variance = data
-            .iter()
             .map(|value| {
                 let diff = average - (*value as f64);
 
                 diff * diff
             })
             .sum::<f64>()
-            / data.len() as f64;
+            / data_points as f64;
 
         variance.sqrt()
     }
 }
 
+/// Statistics gathered for a metric. All timings are in nanoseconds.
 #[derive(Debug)]
 pub struct MetricStats {
+    /// The average nanoseconds elapsed for each execution.
     pub average: f64,
+    /// The minimum nanoseconds elapsed for each execution.
     pub min: u64,
+    /// The maximum nanoseconds elapsed for each execution.
     pub max: u64,
+    /// The [standard deviation][stddev] nanoseconds elapsed for each execution.
+    ///
+    /// [stddev]: https://en.wikipedia.org/wiki/Standard_deviation
     pub stddev: f64,
+    /// The list of all measurements taken, in nanoseconds.
     pub plottable_stats: Vec<u64>,
+    /// The list of measurements that are considered outliers. The heuristic
+    /// that identifies outliers currently looks to see if the difference
+    /// between a measurement and the average measurement is more than 3x the
+    /// [standard deviation](Self::stddev), but the heuristic may change.
     pub outliers: Vec<f64>,
 }
 
+/// A summary of statistics gathered for a single metric across one or more
+/// [`Label`]s.
 #[derive(Debug)]
 pub struct MetricSummary {
+    /// The number of invocations each label observed.
     pub invocations: usize,
+    /// The [`MetricStats`] for each label.
     pub labels: BTreeMap<Label, MetricStats>,
 }
 
+/// A benchmark that helps execute benchmarks with multiple implementations and
+/// configuration options.
+#[must_use]
 pub struct Benchmark<Metric, Config, Error> {
     threads: Vec<usize>,
     configs: Vec<Config>,
@@ -266,8 +389,9 @@ pub struct Benchmark<Metric, Config, Error> {
     functions: Vec<Arc<dyn AnyBenchmarkImplementation<Metric, Config, Error>>>,
 }
 
-impl<Metric, Error> Benchmark<Metric, (), Error> {
-    pub fn new() -> Self {
+#[allow(clippy::mismatching_type_param_order)] // https://github.com/rust-lang/rust-clippy/issues/9367
+impl<Metric, Error> Default for Benchmark<Metric, (), Error> {
+    fn default() -> Self {
         Self {
             threads: Vec::new(),
             configs: vec![()],
@@ -277,18 +401,14 @@ impl<Metric, Error> Benchmark<Metric, (), Error> {
     }
 }
 
-impl<Metric, Error> Default for Benchmark<Metric, (), Error> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<Metric, Config, Error> Benchmark<Metric, Config, Error>
 where
     Error: Send + Sync + 'static,
     Config: Send + Clone + 'static,
     Metric: Send + Sync + 'static,
 {
+    /// Returns a new instance using `config` as the configuration parameter for
+    /// each [`BenchmarkImplementation`].
     pub fn for_config(config: Config) -> Self {
         Self {
             threads: Vec::new(),
@@ -298,6 +418,8 @@ where
         }
     }
 
+    /// Returns a new instance that will invoke each [`BenchmarkImplementation`]
+    /// once for each `config`.
     pub fn for_each_config(configs: Vec<Config>) -> Self {
         Self {
             threads: Vec::new(),
@@ -307,16 +429,22 @@ where
         }
     }
 
-    pub fn with_number_of_threads(mut self, threads: usize) -> Self {
-        self.threads = vec![threads];
-        self
-    }
-
+    /// Updates the timeout used to detect thread start failures.
     pub fn with_thread_start_timeout(mut self, thread_start_timeout: Duration) -> Self {
         self.thread_start_timeout = thread_start_timeout;
         self
     }
 
+    /// Executes the benchmark using `number_of_threads`.
+    pub fn with_number_of_threads(mut self, number_of_threads: usize) -> Self {
+        self.threads = vec![number_of_threads];
+        self
+    }
+
+    /// Executes the benchmark once for each value in `threads`. For example, if
+    /// `[1, 2, 3]` were passed in for `threads`, the benchmark will execute
+    /// once with 1 thread, again with 2 threads, and finally one last time with
+    /// 3 threads.
     pub fn with_each_number_of_threads<ThreadCounts: IntoIterator<Item = usize>>(
         mut self,
         threads: ThreadCounts,
@@ -325,12 +453,16 @@ where
         self
     }
 
+    /// Registers a [`BenchmarkImplementation`] to run.
     pub fn with<Implementation: BenchmarkImplementation<Metric, Config, Error>>(mut self) -> Self {
         self.functions
             .push(Arc::new(BenchmarkImpl::<Implementation>::default()));
         self
     }
 
+    /// Executes the benchmark using all [`BenchmarkImplementation`]s,
+    /// configurations, and thread counts, using `timings` to gather all
+    /// measurements.
     pub fn run(self, timings: &Timings<Metric>) -> Result<(), Error> {
         let threads = if self.threads.is_empty() {
             vec![1]
@@ -341,14 +473,15 @@ where
         for thread_count in threads {
             for config in &self.configs {
                 for function in &self.functions {
+                    let timings = LabeledTimings {
+                        label: function.label(thread_count, config),
+                        timings: timings.clone(),
+                    };
+                    println!("Running {} on {thread_count} threads", timings.label);
                     function.reset(false)?;
-                    let starter = ThreadSync::new(thread_count, self.thread_start_timeout);
-                    let thread_handles = function.measure(
-                        thread_count,
-                        config,
-                        starter.signal().clone(),
-                        timings,
-                    )?;
+                    let starter = ThreadSync::new(self.thread_start_timeout);
+                    let thread_handles =
+                        function.measure(thread_count, config, starter.new_signal(), &timings)?;
 
                     if starter.signal_threads().is_err() {
                         eprintln!("Benchmark thread failed to start in time.");
@@ -368,46 +501,46 @@ where
     }
 }
 
+/// An implementation of logic for a [`Benchmark`].
 pub trait BenchmarkImplementation<Metric, Config, Error>: Sized + Send + Sync + 'static {
+    /// A configuration type that is shared across all threads within a single
+    /// benchmark execution.
     type SharedConfig: Clone + Send + Sync + 'static;
 
+    /// The unique label of this implementation.
+    fn label(number_of_threads: usize, config: &Config) -> Label;
+
+    /// Initializes a [`Self::SharedConfig`] based on the `number_of_threads`
+    /// and `config` provided.
     fn initialize_shared_config(
         number_of_threads: usize,
         config: &Config,
     ) -> Result<Self::SharedConfig, Error>;
 
+    /// Called between benchmark runs to allow cleaning up resources, if needed.
+    /// When `shutting_down` is true, no more benchmarks will be executed.
     fn reset(shutting_down: bool) -> Result<(), Error>;
 
+    /// Initializes an instance of this benchmark implementation using the
+    /// shared configuration.
     fn initialize(number_of_threads: usize, config: Self::SharedConfig) -> Result<Self, Error>;
 
-    fn measure(&mut self, measurements: &Timings<Metric>) -> Result<(), Error>;
+    /// Perform the measurement. This function will be invoked by each of the
+    /// threads that are spawned for the benchmark run.
+    fn measure(&mut self, measurements: &LabeledTimings<Metric>) -> Result<(), Error>;
 }
 
 trait AnyBenchmarkImplementation<Metric, Config, Error>: Sync + Send + 'static {
+    fn label(&self, number_of_threads: usize, config: &Config) -> Label;
     fn reset(&self, shutting_down: bool) -> Result<(), Error>;
     fn measure(
         &self,
         number_of_threads: usize,
         data: &Config,
         thread_sync: ThreadSignal,
-        measurements: &Timings<Metric>,
+        measurements: &LabeledTimings<Metric>,
     ) -> Result<Vec<JoinHandle<Result<(), Error>>>, Error>;
 }
-
-// impl<T, Metric, Config, Error> AnyBenchmarkImplementation<Metric, Config, Error> for T
-// where
-//     T: BenchmarkImplementation<Metric, Config, Error>,
-// {
-//     fn measure(
-//         config: Config,
-//         thread_sync: ThreadSync,
-//         measurements: &Timings<Metric>,
-//     ) -> Result<(), Error> {
-//         let mut data = Self::initialize(config)?;
-//         thread_sync.wait_for_signal();
-//         T::measure(&mut data, measurements)
-//     }
-// }
 
 struct BenchmarkImpl<T>(PhantomData<T>);
 
@@ -424,19 +557,27 @@ where
     Error: Send + 'static,
     Metric: Send + 'static,
 {
+    fn label(&self, number_of_threads: usize, config: &Config) -> Label {
+        T::label(number_of_threads, config)
+    }
+
+    fn reset(&self, shutting_down: bool) -> Result<(), Error> {
+        T::reset(shutting_down)
+    }
+
     fn measure(
         &self,
         number_of_threads: usize,
         config: &Config,
         thread_sync: ThreadSignal,
-        measurements: &Timings<Metric>,
+        measurements: &LabeledTimings<Metric>,
     ) -> Result<Vec<JoinHandle<Result<(), Error>>>, Error> {
         let mut thread_handles = Vec::with_capacity(number_of_threads);
         let shared_config = T::initialize_shared_config(number_of_threads, config)?;
         for _ in 0..number_of_threads {
             let config = shared_config.clone();
             let measurements = measurements.clone();
-            let thread_sync = thread_sync.clone();
+            let mut thread_sync = thread_sync.clone();
             thread_handles.push(std::thread::spawn(move || {
                 let mut data = T::initialize(number_of_threads, config)?;
                 thread_sync.wait();
@@ -445,95 +586,95 @@ where
         }
         Ok(thread_handles)
     }
-
-    fn reset(&self, shutting_down: bool) -> Result<(), Error> {
-        T::reset(shutting_down)
-    }
 }
 
-#[derive(Debug, Clone)]
-pub struct ThreadSignal {
-    data: Arc<ThreadSyncData>,
-}
-
-#[derive(Debug)]
-struct ThreadSyncData {
-    parked_threads: Mutex<Vec<Thread>>,
-    ready_sync: Condvar,
-    countdown: AtomicUsize,
-    number_of_threads: usize,
-    thread_start_timeout: Duration,
-}
-
-impl ThreadSignal {
-    pub fn wait(self) {
-        let mut parked_threads = self.data.parked_threads.lock();
-        parked_threads.push(std::thread::current());
-        drop(parked_threads);
-        self.data.ready_sync.notify_one();
-        std::thread::park();
-
-        // Once we're unparked, enter a spinlock waiting for countdown to reach 0.
-        let mut remaining_threads = self.data.countdown.fetch_sub(1, Ordering::SeqCst) - 1;
-        while remaining_threads > 0 {
-            remaining_threads = self.data.countdown.load(Ordering::SeqCst);
-        }
-    }
-}
-
+/// Synchronizes multiple threads to ensure all waiting threads wake up as close
+/// to simultaneously as possible.
+#[must_use]
 #[derive(Debug)]
 pub struct ThreadSync {
     signal: ThreadSignal,
 }
 
 impl ThreadSync {
-    pub fn new(number_of_threads: usize, thread_start_timeout: Duration) -> Self {
+    /// Returns a new instance that will synchronize the start of
+    /// `number_of_threads` threads.
+    pub fn new(thread_start_timeout: Duration) -> Self {
         let signal = ThreadSignal {
             data: Arc::new(ThreadSyncData {
-                countdown: AtomicUsize::new(number_of_threads),
+                countdown: AtomicUsize::default(),
                 thread_start_timeout,
-                number_of_threads,
                 parked_threads: Mutex::default(),
-                ready_sync: Condvar::new(),
+                parked_sync: Condvar::new(),
+                start_sync: Condvar::new(),
+                epoch: Instant::now(),
+                spinlock_target: AtomicU64::default(),
             }),
+            started: false,
         };
         Self { signal }
     }
 
-    pub const fn signal(&self) -> &ThreadSignal {
-        &self.signal
+    /// Returns a new signal that will be started when [`Self::signal_threads`]
+    /// is called.
+    pub fn new_signal(&self) -> ThreadSignal {
+        self.signal.clone()
     }
 
+    /// Spawns `number_of_threads` threads, calling `thread_main` from each
+    /// thread from all threads as simultaneously as possible.
+    ///
+    /// If available, this function will use CPU core affinity to pin each
+    /// spawned thread to a separate core.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `thread-start_timeout` elapses before all threads are ready.
     pub fn synchronize_spawn<F: Fn() + Clone + Send + 'static>(
         number_of_threads: usize,
         thread_start_timeout: Duration,
         thread_main: F,
     ) {
-        let starter = Self::new(number_of_threads, thread_start_timeout);
-        for _ in 0..number_of_threads {
-            let thread_main = thread_main.clone();
-            let sync = starter.signal().clone();
-            std::thread::spawn(move || {
-                sync.wait();
-                thread_main();
-            });
-        }
-
-        starter.signal_threads().unwrap();
+        Self::synchronize_spawn_with(number_of_threads, thread_start_timeout, &(), move |_| {
+            thread_main();
+        });
     }
 
+    /// Spawns `number_of_threads` threads, calling `thread_main` from each
+    /// thread from all threads as simultaneously as possible. This function
+    /// differs from [`Self::synchronize_spawn`] by cloning `context` and
+    /// passing it into `thread_main`.
+    ///
+    /// If available, this function will use CPU core affinity to pin each
+    /// spawned thread to a separate core.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `thread-start_timeout` elapses before all threads are ready.
     pub fn synchronize_spawn_with<T: Clone + Send + 'static, F: Fn(T) + Clone + Send + 'static>(
         number_of_threads: usize,
         thread_start_timeout: Duration,
         context: &T,
         thread_main: F,
     ) {
-        let starter = Self::new(number_of_threads, thread_start_timeout);
+        let starter = Self::new(thread_start_timeout);
+        let mut core_ids = core_affinity::get_core_ids()
+            .map(Vec::into_iter)
+            .into_iter()
+            .flatten()
+            .collect::<VecDeque<_>>();
         for _ in 0..number_of_threads {
+            let core_id_to_assign = core_ids.pop_front();
+            if let Some(core_id) = core_id_to_assign {
+                core_ids.push_back(core_id);
+            }
             let thread_main = thread_main.clone();
-            let sync = starter.signal().clone();
+            let mut sync = starter.new_signal();
             let context = context.clone();
             std::thread::spawn(move || {
+                if let Some(core_id) = core_id_to_assign {
+                    core_affinity::set_for_current(core_id);
+                }
                 sync.wait();
                 thread_main(context);
             });
@@ -542,17 +683,29 @@ impl ThreadSync {
         starter.signal_threads().unwrap();
     }
 
+    /// Signals all waiting threads to start simultaneously.
+    ///
+    /// This function will wait for all threads to reach the spin-lock phase of
+    /// synchronization, but does not wait for the spinlock to expire before
+    /// returning. This means that this function may return before the threads
+    /// waiting on [`ThreadSignal::wait`] return.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(self)` if a timeout occurs.
     pub fn signal_threads(self) -> Result<(), Self> {
         let deadline = Instant::now() + self.signal.data.thread_start_timeout;
 
         let mut parked_threads = self.signal.data.parked_threads.lock();
+
+        // Wait for threads to park.
         if self
             .signal
             .data
-            .ready_sync
+            .parked_sync
             .wait_while_until(
                 &mut parked_threads,
-                |threads| threads.len() < self.signal.data.number_of_threads,
+                |threads| threads.parked < threads.expected,
                 deadline,
             )
             .timed_out()
@@ -561,43 +714,128 @@ impl ThreadSync {
             return Err(self);
         }
 
-        assert_eq!(self.signal.data.number_of_threads, parked_threads.len());
+        // Set the countdown to the number of threads parked.
+        self.signal
+            .data
+            .countdown
+            .store(parked_threads.parked, Ordering::SeqCst);
 
-        for thread in parked_threads.drain(..) {
-            thread.unpark();
-        }
+        // Signal the thread start.
+        self.signal.data.start_sync.notify_all();
 
         Ok(())
     }
 }
 
-#[test]
-fn thread_start_tolerance() {
-    // We need at least 2 threads to test this.
-    let number_of_threads = std::thread::available_parallelism().unwrap().get().min(2);
+/// A signal that attempts to wake up at the same time as all other signals.
+#[derive(Debug)]
+#[must_use]
+pub struct ThreadSignal {
+    data: Arc<ThreadSyncData>,
+    started: bool,
+}
 
-    let (sender, receiver) = flume::bounded(number_of_threads);
-
-    ThreadSync::synchronize_spawn_with(
-        number_of_threads,
-        Duration::from_secs(1),
-        &sender,
-        |sender| {
-            sender.send(Instant::now()).unwrap();
-        },
-    );
-    drop(sender);
-
-    let mut start_times = Vec::with_capacity(number_of_threads);
-    for _ in 0..number_of_threads {
-        start_times.push(receiver.recv().unwrap());
+impl Clone for ThreadSignal {
+    fn clone(&self) -> Self {
+        let mut state = self.data.parked_threads.lock();
+        state.expected += 1;
+        Self {
+            data: self.data.clone(),
+            started: false,
+        }
     }
-    assert!(receiver.try_recv().is_err());
-    let earliest_start = start_times.iter().min().unwrap();
-    let latest_start = start_times.iter().max().unwrap();
-    let delta = latest_start
-        .checked_duration_since(*earliest_start)
-        .unwrap();
-    println!("Sync start instant max delta: {:.03}ns", delta.as_nanos());
-    assert!(delta < Duration::from_micros(10));
+}
+
+impl Drop for ThreadSignal {
+    fn drop(&mut self) {
+        if !self.started {
+            let mut state = self.data.parked_threads.lock();
+            state.expected -= 1;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ThreadSyncData {
+    parked_threads: Mutex<ParkState>,
+    parked_sync: Condvar,
+    start_sync: Condvar,
+    countdown: AtomicUsize,
+    spinlock_target: AtomicU64,
+    thread_start_timeout: Duration,
+    epoch: Instant,
+}
+
+#[derive(Debug, Default)]
+struct ParkState {
+    expected: usize,
+    parked: usize,
+}
+
+impl ThreadSignal {
+    /// Waits for [`ThreadSync::signal_threads()`], and after waking up uses a
+    /// spin lock to synchronize all signaled threads. After all threads have
+    /// woken up, this thread will return.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once.
+    ///
+    /// This function does not consume self, as invoking Drop will execute
+    /// additional code that affects atomic variables (`Arc`). This can impact
+    /// the effectiveness of the spinlock. By deferring the drop to the calling
+    /// function, cleanup can happen after the synchronized code is executed.
+    pub fn wait(&mut self) {
+        let mut parked_threads = self.data.parked_threads.lock();
+        parked_threads.parked += 1;
+        self.data.parked_sync.notify_one();
+
+        // Mark this instance as having started, which prevents Drop from
+        // cleaning up the countdown.
+        self.started = true;
+
+        // wait for the start signal
+        self.data.start_sync.wait(&mut parked_threads);
+
+        // Allow all other threads to wake up as well.
+        drop(parked_threads);
+
+        // Once we're unparked, enter a spinlock waiting for countdown to reach 0.
+        let remaining_threads = self.data.countdown.fetch_sub(1, Ordering::SeqCst) - 1;
+        let spinlock_target = if remaining_threads == 0 {
+            // This thread is the last thread to wake up. Set the spinlock
+            // target. 100 microseconds is an eternity since at this stage we've
+            // guaranteed all the threads have unparked and are in one of the
+            // loops in the other branch of this if statement. Despite this
+            // guarantee, it's still possible for the scheduler to pause a
+            // thread and not wake it back up until after this spinlock expires.
+            let spinlock_target = self.nanos_since_epoch() + 100_000; // 100us
+            self.data
+                .spinlock_target
+                .store(spinlock_target, Ordering::Relaxed);
+            spinlock_target
+        } else {
+            // Wait for the spinlock target to be published.
+            loop {
+                let spinlock_target = self.data.spinlock_target.load(Ordering::Acquire);
+                if spinlock_target > 0 {
+                    break spinlock_target;
+                }
+            }
+        };
+
+        // Wait until the target timestamp.
+        let target_instant = self.data.epoch + Duration::from_nanos(spinlock_target);
+        while Instant::now() <= target_instant {}
+    }
+
+    #[inline]
+    fn nanos_since_epoch(&self) -> u64 {
+        self.data
+            .epoch
+            .elapsed()
+            .as_nanos()
+            .try_into()
+            .expect("too much time elapsed (585 years)")
+    }
 }

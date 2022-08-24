@@ -9,7 +9,7 @@ fn main() {
     // This example is meant to showcase the simplicity. Let's say that we have
     // a process that has three steps, and we want to measure each step's
     // performance when using different backends.
-    let (timings, stats_handle) = Timings::new();
+    let timings = Timings::default();
 
     // Measure the operations
     for algorithm in ["backend a", "backend b", "backend c"] {
@@ -30,13 +30,9 @@ fn main() {
         }
     }
 
-    // The stats thread will not return its report until all instances of
-    // `Measurements` have been dropped.
-    drop(timings);
-
     // Retrieve the statistics report, which includes summaries as well as the
     // raw measurements collected.
-    let stats = stats_handle.join().unwrap();
+    let stats = timings.wait_for_stats();
 
     // Print the summary.
     timings::print_table_summaries(&stats).unwrap();

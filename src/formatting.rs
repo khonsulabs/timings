@@ -1,30 +1,33 @@
 use std::{
-    collections::BTreeMap,
     fmt::Display,
     io::{stdout, Write},
 };
 
-use tabled::{Header, Table, Tabled};
+use tabled::{Style, Table, Tabled};
 
-use crate::{Label, MetricStats, MetricSummary};
+use crate::{Label, MetricStats, MetricSummaries};
 
+/// Prints a formatted `report` to stdout.
 pub fn print_table_summaries<Metric: Display>(
-    report: &BTreeMap<Metric, MetricSummary>,
+    report: &MetricSummaries<Metric>,
 ) -> std::io::Result<()> {
     write_table_summaries(stdout(), report)
 }
 
+/// Formats `report` into `writer`.
 pub fn write_table_summaries<Writer: Write, Metric: Display>(
     mut writer: Writer,
-    report: &BTreeMap<Metric, MetricSummary>,
+    report: &MetricSummaries<Metric>,
 ) -> std::io::Result<()> {
     for (metric, summary) in report {
+        writeln!(writer, "\n# {metric}")?;
         writer.write_all(
             Table::new(&summary.labels)
-                .with(Header(metric.to_string()))
+                .with(Style::markdown())
                 .to_string()
                 .as_bytes(),
         )?;
+        writeln!(writer)?;
     }
     Ok(())
 }
@@ -44,6 +47,7 @@ impl Tabled for Label {
 impl Tabled for MetricStats {
     const LENGTH: usize = 5;
 
+    #[allow(clippy::cast_precision_loss)]
     fn fields(&self) -> Vec<String> {
         let total_metrics = self.plottable_stats.len() + self.outliers.len();
         let outlier_percent = if total_metrics > 0 {
