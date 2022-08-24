@@ -404,7 +404,7 @@ impl<Metric, Error> Default for Benchmark<Metric, (), Error> {
 impl<Metric, Config, Error> Benchmark<Metric, Config, Error>
 where
     Error: Send + Sync + 'static,
-    Config: Send + Clone + 'static,
+    Config: Debug + Send + Clone + 'static,
     Metric: Send + Sync + 'static,
 {
     /// Returns a new instance using `config` as the configuration parameter for
@@ -471,13 +471,15 @@ where
         };
 
         for thread_count in threads {
+            println!("Benchmarking {thread_count} threads");
             for config in &self.configs {
+                println!("- Configuration: {config:?}");
                 for function in &self.functions {
                     let timings = LabeledTimings {
                         label: function.label(thread_count, config),
                         timings: timings.clone(),
                     };
-                    println!("Running {} on {thread_count} threads", timings.label);
+                    println!("  - {}", timings.label);
                     function.reset(false)?;
                     let starter = ThreadSync::new(self.thread_start_timeout);
                     let thread_handles =
